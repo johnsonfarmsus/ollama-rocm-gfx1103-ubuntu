@@ -12,10 +12,46 @@ The setup script in this repo closes the gap by:
 
 1. Building [`likelovewant/ollama-for-amd`](https://github.com/likelovewant/ollama-for-amd) from source with `-DAMDGPU_TARGETS=gfx1103`.
 2. Applying three small patches to `ml/device.go` — see [`patches/`](patches/).
-3. Downloading Fedora 43's `rocblas-6.4.0-7.fc43.x86_64.rpm` and extracting just the `gfx1103` Tensile kernel files (the actual GPU bytecode) into the system rocBLAS library directory. The kernel binaries are distribution-agnostic at the binary level — Fedora's compile, Ubuntu's runtime, no problem.
-4. Writing a systemd drop-in so the resulting setup survives reboot and (optionally) pins Ollama to a specific GPU on multi-GPU systems.
+3. Downloading Fedora 44's `rocblas-7.1.1-7.fc44.x86_64.rpm` and extracting just the `gfx1103` Tensile kernel files (the actual GPU bytecode) into the system rocBLAS library directory. The kernel binaries are distribution-agnostic at the binary level — Fedora's compile, Ubuntu's runtime, no problem **as long as the kernel ABI matches the runtime ABI**. Earlier versions of this repo used Fedora 43's rocBLAS 6.4 kernels; those run but crash often under 7.1 runtime (see the **Stability** section below).
+4. Writing a systemd drop-in so the resulting setup survives reboot, disables Flash Attention (required — see Stability), enables a long keep-alive, and (optionally) pins Ollama to a specific GPU on multi-GPU systems.
 
-After running, Ollama reports `library=ROCm compute=gfx1103` and inference runs at ~24–48 tokens/sec on `gemma4:e2b` (vs ~16 tok/s CPU-only).
+After running, Ollama reports `library=ROCm compute=gfx1103` and inference runs at ~12–48 tokens/sec on `gemma4:e2b`/`e4b` depending on prompt size (vs ~16 tok/s CPU-only).
+
+## Stability — what to actually expect
+
+**This setup is not 100% reliable.** Read this section before deploying it for anything you care about.
+
+After completing the steps above on Ubuntu 26.04 with ROCm 7.1 system libs, we measured a **persistent ~14% rate of mid-inference runner crashes** with the error signature `ROCm error: unspecified launch failure` (originating from `hipStreamSynchronize` in ggml's HIP backend). The crashes are intermittent — they don't deterministically correlate with prompt size or model — and they require Ollama to respawn the runner before the next request can be served. From the user's perspective, ~1 in 7 chat completions returns HTTP 500 with "model runner has unexpectedly stopped."
+
+We tried two paths to drive that residual rate to zero and **neither worked**:
+
+1. Replacing the Fedora-sourced Tensile kernels with kernels built fresh from upstream rocBLAS source — same result.
+2. Rebuilding `ollama-for-amd`'s HIP backend (`libggml-hip.so`) against the current system ROCm headers/libs — same result.
+
+The bug appears to live below userspace: in the HIP runtime, the amdgpu kernel module, or Tensile's runtime kernel-selection logic. None of that is fixable from inside this repo. As of late May 2026 we have not found a userspace workaround that closes the gap.
+
+What this script reliably delivers:
+
+- ✅ Native ROCm acceleration on gfx1103 — actual GPU inference, not CPU fallback (~3-5× faster than CPU)
+- ✅ Reduction from ~42% crash rate (Fedora 6.4 kernels, the previous default) to ~14% (Fedora 7.1.1 kernels, what this script now ships)
+- ✅ Crash-resistant Flash Attention path (forced off — see `override.conf`)
+
+What it does **not** deliver:
+
+- ❌ Production-grade reliability for unattended workloads
+- ❌ Stability for long-context (>8k token) prompts under sustained load
+- ❌ A fix for the underlying gfx1103 ROCm driver/runtime issues
+
+### Recommended usage patterns given the residual crash rate
+
+- **Short conversations and routine chat**: works well; crashes are rare in this regime.
+- **Heavy/long-context queries**: route to a cloud LLM provider instead, or be prepared to retry on failure.
+- **Always-on agents and bot workloads**: wrap calls in retry logic that respects a brief backoff while the runner respawns (~5s for a hot model).
+- **Production**: don't. Use a dGPU with CUDA, or wait for ROCm/amdgpu fixes upstream.
+
+### Alternative: Vulkan backend
+
+Ollama has a Vulkan backend that uses Mesa RADV instead of ROCm. RADV has *much* more mature gfx1103 support and reportedly hits ~0% crash rate on this hardware, at the cost of roughly 30-40% throughput vs. native ROCm. If the crash rate above is a dealbreaker for your use case, building Ollama with `OLLAMA_VULKAN=1` may be the better path. That's not what this repo automates, but it's the obvious escape hatch from this stack's instability.
 
 ## Requirements
 
@@ -87,6 +123,8 @@ This whole approach is held together by a specific set of gaps in the ecosystem.
 - When Ubuntu eventually ships gfx1103 kernels in their `librocblas5` package (likely in 27.04 or whenever ROCm 7.x integrates Phoenix), step 6 of the script becomes unnecessary.
 - When upstream Ollama integrates the AMD-tuned code (or fixes the sort bias separately), the patches in this repo may stop applying cleanly. If `git apply --check` fails, the patches need to be re-derived against the new upstream.
 - An `apt upgrade` of `librocblas5` will overwrite the kernel files. Re-run `setup.sh` afterward.
+- **Kernel ABI must match runtime ABI.** Earlier versions of this script used Fedora 43's rocBLAS 6.4 kernels with Ubuntu's rocBLAS 7.1 runtime — this looked like it worked but caused frequent crashes. The current script uses Fedora 44's matching rocBLAS 7.1.1 build. When you update your system's rocBLAS (e.g., to 7.2 in a future Ubuntu release), update the Fedora RPM URL in `setup.sh` to a Fedora build at the matching version.
+- The **~14% residual crash rate** documented in the Stability section is unrelated to any of the gaps this repo closes — it's an underlying gfx1103 driver/runtime issue. If a future ROCm release or amdgpu kernel patch fixes it, that's a free improvement; nothing here needs to change to benefit from it.
 
 None of these are imminent as of May 2026.
 
