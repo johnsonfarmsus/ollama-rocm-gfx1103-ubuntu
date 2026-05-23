@@ -8,8 +8,14 @@
 #   3. Applies three patches to ml/device.go
 #   4. Builds the C++/HIP backend (libggml-hip.so) targeting gfx1103
 #   5. Builds the Go binary
-#   6. Downloads Fedora 43's rocblas RPM and extracts gfx1103 Tensile kernels
-#      into the system rocBLAS library directory
+#   6. Downloads Fedora 44's rocblas 7.1.1 RPM and extracts gfx1103 Tensile
+#      kernels into the system rocBLAS library directory. Critical: the
+#      Fedora version must match the system's rocBLAS runtime ABI. Earlier
+#      versions of this script used Fedora 43's rocblas 6.4 — those kernels
+#      run under 7.1 but trigger frequent "ROCm error: unspecified launch
+#      failure" crashes because the kernels were built against an older
+#      Tensile/rocBLAS ABI. Always use the kernel version that matches your
+#      runtime version.
 #   7. Installs the binary + libs, writes a systemd drop-in, restarts Ollama
 #   8. Runs a smoke test
 #
@@ -21,7 +27,7 @@ set -euo pipefail
 # ---------- configuration ----------
 WORK_DIR="${WORK_DIR:-$HOME/ollama-rocm-gfx1103-build}"
 FORK_URL="${FORK_URL:-https://github.com/likelovewant/ollama-for-amd.git}"
-FEDORA_RPM_URL="${FEDORA_RPM_URL:-https://kojipkgs.fedoraproject.org/packages/rocblas/6.4.0/7.fc43/x86_64/rocblas-6.4.0-7.fc43.x86_64.rpm}"
+FEDORA_RPM_URL="${FEDORA_RPM_URL:-https://kojipkgs.fedoraproject.org/packages/rocblas/7.1.1/7.fc44/x86_64/rocblas-7.1.1-7.fc44.x86_64.rpm}"
 GPU_TARGET="${GPU_TARGET:-gfx1103}"
 ROCR_PIN_DEVICE="${ROCR_PIN_DEVICE:-}"  # leave empty if you have only one ROCm GPU
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -102,7 +108,7 @@ log "building Go binary"
 go build -trimpath -o ollama .
 
 # ---------- step 6: download Fedora RPM and extract gfx1103 kernels ----------
-log "downloading Fedora 43 rocblas RPM (170 MB)"
+log "downloading Fedora 44 rocblas 7.1.1 RPM (276 MB)"
 mkdir -p "$WORK_DIR/fedora-rocblas"
 curl -fsSL -o "$WORK_DIR/rocblas.rpm" "$FEDORA_RPM_URL"
 
@@ -111,8 +117,11 @@ cd "$WORK_DIR/fedora-rocblas"
 bsdtar -xf "$WORK_DIR/rocblas.rpm"
 
 KERNEL_COUNT=$(find . -name "*${GPU_TARGET}*" | wc -l)
-if [ "$KERNEL_COUNT" -lt 10 ]; then
-    die "Fedora RPM didn't contain $GPU_TARGET kernels (found $KERNEL_COUNT files); maybe gfx1103 was renamed or removed in newer ROCm"
+# Fedora 44's rocblas 7.1.1 ships 96 gfx1103 files. Demand at least 50 so
+# we catch the case where the RPM URL above silently regresses to an older
+# build that doesn't actually have working kernels for this arch.
+if [ "$KERNEL_COUNT" -lt 50 ]; then
+    die "Fedora RPM didn't contain enough $GPU_TARGET kernels (found $KERNEL_COUNT, expected ~96); maybe the RPM URL is stale or gfx1103 was dropped from newer ROCm"
 fi
 
 # Locate the system rocBLAS library directory
