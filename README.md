@@ -19,9 +19,31 @@ After running, Ollama reports `library=ROCm compute=gfx1103` and inference runs 
 
 ## Stability — what to actually expect
 
-**With the requirements met (Ubuntu 26.04 HWE kernel `7.0.0-15` or newer), this setup is rock-solid.** Measured 0/56 failures across 56 stress-test prompts ranging from 17 to 14,024 tokens.
+**With Ubuntu HWE kernel `7.0.0-15` or newer and the recommended conservative env-var config, this setup is reliable enough for daily use.** Measured ~99% success rate (1 failure in 84 tests at the conservative config). The kernel update from `-14` to `-15` substantially reduces — but does not fully eliminate — the underlying MES (Micro Engine Scheduler) issue.
 
-This was not always the case. Earlier versions of this README documented a persistent ~14% mid-inference crash rate (`ROCm error: unspecified launch failure`) that we couldn't eliminate from userspace. The root cause turned out to be a **Linux kernel bug** in the amdgpu driver's interaction with the GPU's MES (Micro Engine Scheduler) firmware on gfx11.x chips: under certain teardown patterns, the kernel would send `REMOVE_QUEUE` to MES, MES would fail to respond, and amdgpu would issue a full GPU reset — killing any in-flight inference. The signature in `dmesg` is:
+The history of this number:
+
+- **~42% crash rate** = Fedora 6.4 rocBLAS kernels under Ubuntu's rocBLAS 7.1 runtime. Fix: re-run `setup.sh` (it now uses matching Fedora 7.1.1 kernels).
+- **~14% crash rate** = correct kernels but kernel ≤ `7.0.0-14`. Fix: `sudo apt install linux-image-generic-hwe-26.04 && sudo reboot`.
+- **~1% crash rate** = correct kernels AND kernel `7.0.0-15+` AND the conservative env-var config below. This is the best we've measured.
+
+### What "conservative env-var config" means
+
+The default Ollama settings (`OLLAMA_NUM_BATCH=512` and 4k default context) are fine *if your workload is tiny*, but pushing context up or running a higher batch size makes the compute graph large enough that the residual MES susceptibility comes back. The combination that we've measured 99% success on is:
+
+```ini
+Environment="OLLAMA_FLASH_ATTENTION=0"      # disable FA; still brittle on gfx1103
+Environment="OLLAMA_CONTEXT_LENGTH=16384"   # 16k, NOT 32k or higher
+Environment="OLLAMA_NUM_BATCH=256"          # 256, NOT the default 512
+Environment="OLLAMA_KEEP_ALIVE=24h"         # keep models resident
+Environment="OLLAMA_MAX_LOADED_MODELS=1"    # one model at a time
+```
+
+The `override.conf` template in this repo ships these defaults.
+
+### The dmesg signature to watch for
+
+If crashes do happen on `-15` with these settings, check `sudo dmesg | grep MES`. The bug looks like:
 
 ```
 amdgpu: MES failed to respond to msg=REMOVE_QUEUE
@@ -29,26 +51,24 @@ amdgpu: MES might be in unrecoverable state, issue a GPU reset
 amdgpu: GPU reset succeeded, trying to resume
 ```
 
-The fix landed upstream in the Linux 6.11–6.13 window and is included in Ubuntu's HWE kernel `7.0.0-15` and later. Upgrading from `-14` → `-15` took our failure rate from ~14% to **0%** with no other changes. If you see the symptoms above on `-14` or earlier, just upgrade your kernel.
+If you see these messages clustered around the crash times, you're hitting the residual MES issue. The mitigation is to push context and batch *down* (toward 8k / 128) until they stop. If they appear without the MES messages, the crash is something else and is worth opening an issue about.
 
-What this script delivers when the requirements are met:
+### What this setup delivers
 
-- ✅ Native ROCm acceleration on gfx1103 — actual GPU inference, not CPU fallback (~3-5× faster than CPU)
-- ✅ 0% measured failure rate on prompts up to ~14k tokens
-- ✅ Stable across rebuilds, model reloads, and long-running daemons (model resident for 24h via `OLLAMA_KEEP_ALIVE`)
-- ✅ Crash-resistant Flash Attention path (forced off — see `override.conf` comment for why this is still recommended belt-and-suspenders)
+- ✅ Native ROCm acceleration on gfx1103 (~3-5× faster than CPU)
+- ✅ ~99% measured success rate on prompts up to 14k tokens at the conservative config
+- ✅ Stable enough for typical chat workloads and OWUI web-search use
+- ✅ Suitable as a fallback for sparse-traffic API consumers (e.g., a Matrix bot)
 
-### Historical note: 42% → 14% → 0%
+### What it does not deliver
 
-For anyone hitting this repo after following an earlier version:
-
-- **~42% crash rate** = you're on Fedora 6.4 rocBLAS kernels under Ubuntu's rocBLAS 7.1 runtime. Fix: re-run `setup.sh` (it now uses matching Fedora 7.1.1 kernels).
-- **~14% crash rate** = correct kernels but kernel ≤ `7.0.0-14`. Fix: `sudo apt install linux-image-generic-hwe-26.04 && sudo reboot`. (The HWE package is what pulls in `-15`; you may need to enable HWE on older Ubuntu point releases.)
-- **0% crash rate** = correct kernels AND kernel `7.0.0-15+`. You're done.
+- ❌ Zero crashes. ~1% of requests will still error out and need a retry.
+- ❌ Production-grade reliability for unattended workloads with no retry logic.
+- ❌ Stability at high context (>16k) or default batch size — the MES bug returns at scale.
 
 ### Alternative: Vulkan backend
 
-If for some reason you can't run a `-15`-or-newer kernel, Ollama supports Vulkan via Mesa RADV instead of ROCm. RADV has very mature gfx1103 support and hits 0% crash rate even on older kernels, at the cost of roughly 30-40% throughput vs. ROCm. Worth knowing as a fallback if your environment pins you to an older kernel for unrelated reasons, but the ROCm path described in this README is the recommended one with current kernels.
+If for some reason you can't run a `-15`-or-newer kernel, or if 99% isn't good enough for your use case, Ollama supports Vulkan via Mesa RADV instead of ROCm. RADV has very mature gfx1103 support and is reportedly crash-free even on older kernels, at the cost of roughly 30-40% throughput vs. ROCm. The ROCm path in this README is the recommended one for current kernels, but Vulkan is a real escape hatch if you need the last 1%.
 
 ## Requirements
 
