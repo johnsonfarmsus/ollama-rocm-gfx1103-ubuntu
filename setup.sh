@@ -58,6 +58,34 @@ if ! [ -r "$OVERRIDE_TEMPLATE" ]; then
     die "override.conf template not found at $OVERRIDE_TEMPLATE"
 fi
 
+# ---------- kernel version check ----------
+# Older kernels (≤ 7.0.0-14 in Ubuntu's numbering, or upstream < 6.11) have
+# a gfx11 MES REMOVE_QUEUE bug that causes ~14% of inference requests to
+# crash with "ROCm error: unspecified launch failure" and a GPU reset. The
+# fix landed in Ubuntu's HWE kernel 7.0.0-15. Bail out early if the running
+# kernel is too old — saves the user the surprise of a working ROCm setup
+# that's still constantly crashing.
+KERNEL=$(uname -r)
+KERNEL_MAJOR=$(echo "$KERNEL" | grep -oE "^[0-9]+\.[0-9]+\.[0-9]+-[0-9]+" | head -1)
+case "$KERNEL_MAJOR" in
+    7.0.0-1[5-9]|7.0.0-[2-9][0-9]|7.[1-9].*|[89].*.*)
+        # 7.0.0-15+ on the Ubuntu 26.04 HWE line, or anything newer
+        :
+        ;;
+    7.0.0-1[0-4]|7.0.0-[0-9])
+        warn "your running kernel is $KERNEL (older than 7.0.0-15)"
+        warn "older kernels have a gfx11 MES bug that causes ~14% of inference"
+        warn "requests to crash. To upgrade:"
+        warn "  sudo apt install linux-image-generic-hwe-26.04"
+        warn "  sudo reboot"
+        die  "refusing to continue on a kernel known to be broken for this stack"
+        ;;
+    *)
+        # unrecognized version pattern — warn but proceed
+        warn "could not parse kernel version '$KERNEL'; assuming it's new enough"
+        ;;
+esac
+
 # ---------- step 1: install build dependencies ----------
 log "installing build dependencies (this may take a while on first run)"
 sudo apt-get update
