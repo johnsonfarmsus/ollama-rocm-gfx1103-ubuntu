@@ -19,17 +19,18 @@ After running, Ollama reports `library=ROCm compute=gfx1103` and inference runs 
 
 ## Stability — what to actually expect
 
-**With Ubuntu HWE kernel `7.0.0-15` or newer and the recommended conservative env-var config, this setup is reliable enough for daily use.** Measured ~99% success rate (1 failure in 84 tests at the conservative config). The kernel update from `-14` to `-15` substantially reduces — but does not fully eliminate — the underlying MES (Micro Engine Scheduler) issue.
+**With Ubuntu HWE kernel `7.0.0-15` or newer, the conservative env-var config below, and (if you're using Open WebUI) the correct OWUI bypass setting, this setup is reliable enough for daily use.** Latest measurement: **52/52 successful OWUI web-search chat completions** in a real-world session, zero MES events.
 
 The history of this number:
 
 - **~42% crash rate** = Fedora 6.4 rocBLAS kernels under Ubuntu's rocBLAS 7.1 runtime. Fix: re-run `setup.sh` (it now uses matching Fedora 7.1.1 kernels).
 - **~14% crash rate** = correct kernels but kernel ≤ `7.0.0-14`. Fix: `sudo apt install linux-image-generic-hwe-26.04 && sudo reboot`.
-- **~1% crash rate** = correct kernels AND kernel `7.0.0-15+` AND the conservative env-var config below. This is the best we've measured.
+- **~30% crash rate** specifically with OWUI web search, even on kernel `-15` with the env-var config below = Ollama Cloud Search returning full Wikipedia articles (~41k tokens per result) and OWUI passing them through unchunked, producing 150k+ token prompts that get truncated to 16k *and* exercise the residual MES issue at scale. Fix: see [Using with Open WebUI](#using-with-open-webui) below — flip OWUI's `bypass_embedding_and_retrieval` to **False** so it chunks + retrieves top-k instead.
+- **0% crash rate observed** = all of the above in place. The set of fixes is non-obvious because the failure modes look identical (the same "ROCm error: unspecified launch failure" can come from any of them). All four layers need to be right.
 
 ### What "conservative env-var config" means
 
-The default Ollama settings (`OLLAMA_NUM_BATCH=512` and 4k default context) are fine *if your workload is tiny*, but pushing context up or running a higher batch size makes the compute graph large enough that the residual MES susceptibility comes back. The combination that we've measured 99% success on is:
+The default Ollama settings (`OLLAMA_NUM_BATCH=512` and 4k default context) are fine *if your workload is tiny*, but pushing context up or running a higher batch size makes the compute graph large enough that the residual MES susceptibility comes back. The combination that works reliably:
 
 ```ini
 Environment="OLLAMA_FLASH_ATTENTION=0"      # disable FA; still brittle on gfx1103
@@ -51,24 +52,51 @@ amdgpu: MES might be in unrecoverable state, issue a GPU reset
 amdgpu: GPU reset succeeded, trying to resume
 ```
 
-If you see these messages clustered around the crash times, you're hitting the residual MES issue. The mitigation is to push context and batch *down* (toward 8k / 128) until they stop. If they appear without the MES messages, the crash is something else and is worth opening an issue about.
+If you see these messages clustered around crash times, you're hitting the residual MES issue. Most common cause if your env-vars are correct: OWUI sending a giant prompt (see next section). Less common: pushing context above 16k or batch above 256 for some workload. The mitigation in either case is to make the compute graph smaller.
 
-### What this setup delivers
+### Using with Open WebUI
+
+If you're consuming this Ollama instance from [Open WebUI](https://github.com/open-webui/open-webui) with web search enabled, **there are two OWUI-side settings that matter as much as the Ollama-side env-vars above** — and one of them is non-obvious:
+
+| OWUI Setting (Admin Panel → Settings → Web Search) | Value | Why |
+|---|---|---|
+| `bypass_web_loader` | **True** | Skip the langchain HTML scrape step. Without this, OWUI re-fetches every URL through a default user-agent that Cloudflare-protected sites (egpu.io, dev.to, etc.) block. Symptom: model says "I see N sources but no content." |
+| `bypass_embedding_and_retrieval` | **False** ← counterintuitive! | Earlier guidance said True. **Wrong for most search engines.** Ollama Cloud Search returns full page content (Wikipedia articles = ~41k tokens per result). With `bypass=True`, OWUI shoves all of it (3 query variants × 3 results = ~150k tokens) directly into the prompt; Ollama truncates to 16k, dropping most of the actual relevant content, and the heavy compute graph triggers MES failures. With `bypass=False`, OWUI chunks the content (chunk_size=1000), embeds on CPU using `sentence-transformers/all-MiniLM-L6-v2`, and ships only the top-k most relevant chunks (~3k tokens) to the model. Same answer quality, ~50× smaller prompt, dramatically more stable. |
+
+To change `bypass_embedding_and_retrieval` from True → False reliably (the UI toggle can be overwritten by OWUI's in-memory state on restart), stop the container first:
+
+```bash
+sudo docker stop open-webui
+
+# patch the setting in the SQLite blob while the container isn't running
+sudo docker run --rm -v open-webui:/data alpine sh -c '\''
+  apk add --quiet sqlite > /dev/null
+  sqlite3 /data/webui.db "
+    UPDATE config
+    SET data = json_set(data, '\''"\$"'\''.rag.web.search.bypass_embedding_and_retrieval, json('\''"false"'\''));"
+'\''
+
+sudo docker start open-webui
+```
+
+(Or you can edit through the OWUI UI — Admin Panel → Settings → Web Search — and just hope the in-memory state matches what you saved.)
+
+### What this setup delivers (with all four layers in place)
 
 - ✅ Native ROCm acceleration on gfx1103 (~3-5× faster than CPU)
-- ✅ ~99% measured success rate on prompts up to 14k tokens at the conservative config
-- ✅ Stable enough for typical chat workloads and OWUI web-search use
-- ✅ Suitable as a fallback for sparse-traffic API consumers (e.g., a Matrix bot)
+- ✅ Measured 52/52 successful web-search chats in a real-world session
+- ✅ Stable for typical chat workloads, OWUI web-search use, and Matrix-bot-style API traffic
+- ✅ ~13-14 tok/s short context, ~6-8 tok/s at 14k context
 
 ### What it does not deliver
 
-- ❌ Zero crashes. ~1% of requests will still error out and need a retry.
+- ❌ A 100% guarantee — the MES bug is reduced not eliminated by kernel `-15`; consumers should still expect occasional retries on long-context heavy workloads.
 - ❌ Production-grade reliability for unattended workloads with no retry logic.
 - ❌ Stability at high context (>16k) or default batch size — the MES bug returns at scale.
 
 ### Alternative: Vulkan backend
 
-If for some reason you can't run a `-15`-or-newer kernel, or if 99% isn't good enough for your use case, Ollama supports Vulkan via Mesa RADV instead of ROCm. RADV has very mature gfx1103 support and is reportedly crash-free even on older kernels, at the cost of roughly 30-40% throughput vs. ROCm. The ROCm path in this README is the recommended one for current kernels, but Vulkan is a real escape hatch if you need the last 1%.
+If for some reason you can't run a `-15`-or-newer kernel, or if you need fully unattended reliability, Ollama supports Vulkan via Mesa RADV instead of ROCm. RADV has very mature gfx1103 support and is reportedly crash-free even on older kernels, at the cost of roughly 30-40% throughput vs. ROCm. The ROCm path in this README is the recommended one with current kernels, but Vulkan is a real escape hatch.
 
 ## Requirements
 
