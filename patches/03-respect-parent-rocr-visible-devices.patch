@@ -27,7 +27,7 @@ diff --git a/ml/device.go b/ml/device.go
  	"context"
  	"encoding/binary"
  	"encoding/json"
-@@ -581,6 +582,11 @@ func (d DeviceInfo) updateVisibleDevicesEnv(env map[string]string, mustFilter bo
+@@ -576,6 +577,12 @@ func (d DeviceInfo) updateVisibleDevicesEnv(env map[string]string, mustFilter bo
  		if runtime.GOOS != "linux" {
  			envVar = "HIP_VISIBLE_DEVICES"
  		}
